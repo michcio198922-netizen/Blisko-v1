@@ -32,15 +32,33 @@ jobs:
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
 
-      - name: Sprawdź sekrety podpisu
+      - name: Sprawdź sekrety
         env:
           KEYSTORE_BASE64: ${{ secrets.BLISKO_KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.BLISKO_KEYSTORE_PASSWORD }}
+          RAW_PASSWORD: ${{ secrets.BLISKO_KEYSTORE_PASSWORD }}
+        shell: bash
         run: |
-          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$RAW_PASSWORD" ]; then
             echo "Brakuje BLISKO_KEYSTORE_BASE64 lub BLISKO_KEYSTORE_PASSWORD."
             exit 1
           fi
+
+          python - <<'PY'
+          import os
+          raw = os.environ["RAW_PASSWORD"]
+          clean = raw.strip()
+
+          if not clean:
+              raise SystemExit("Hasło po usunięciu białych znaków jest puste.")
+
+          if not clean.isascii():
+              raise SystemExit("BLISKO_KEYSTORE_PASSWORD zawiera znak spoza ASCII. Wklej ponownie zawartość pliku TXT.")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write("BLISKO_CLEAN_PASSWORD=" + clean + "\n")
+
+          print("Hasło wygląda poprawnie (bez ujawniania jego wartości).")
+          PY
 
       - name: Ustaw numer wersji
         run: |
@@ -51,22 +69,80 @@ jobs:
         run: npm install
 
       - name: Wygeneruj projekt Android
-        env:
-          BLISKO_KEYSTORE_PASSWORD: ${{ secrets.BLISKO_KEYSTORE_PASSWORD }}
         run: npx expo prebuild --platform android --clean --non-interactive
 
-      - name: Odtwórz klucz podpisu
+      - name: Wymuś build bez podpisu Gradle
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path("android/app/build.gradle")
+          s = p.read_text(encoding="utf-8")
+
+          # Odcinamy zarówno stary plugin Blisko, jak i domyślny podpis debug.
+          s = s.replace("signingConfig signingConfigs.bliskoRelease", "")
+          s = s.replace("signingConfig signingConfigs.debug", "")
+
+          p.write_text(s, encoding="utf-8")
+          print("Gradle release będzie budowany bez podpisu.")
+          PY
+
+      - name: Odtwórz i sprawdź klucz
         env:
           KEYSTORE_BASE64: ${{ secrets.BLISKO_KEYSTORE_BASE64 }}
-        run: echo "$KEYSTORE_BASE64" | base64 --decode > android/app/blisko-release.jks
+        shell: bash
+        run: |
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > blisko-release.jks
+
+          keytool -list \
+            -keystore blisko-release.jks \
+            -storepass "$BLISKO_CLEAN_PASSWORD" \
+            -alias blisko >/dev/null
+
+          echo "Klucz i hasło są poprawne."
 
       - name: Zbuduj release APK
-        env:
-          BLISKO_KEYSTORE_PASSWORD: ${{ secrets.BLISKO_KEYSTORE_PASSWORD }}
         run: |
           chmod +x android/gradlew
           cd android
           ./gradlew assembleRelease --stacktrace
+
+      - name: Podpisz gotowe APK
+        shell: bash
+        run: |
+          set -e
+
+          APK="$(find android/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' ! -name 'app-release.apk' | head -n 1)"
+
+          if [ -z "$APK" ]; then
+            APK="$(find android/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' | head -n 1)"
+          fi
+
+          if [ -z "$APK" ]; then
+            echo "Nie znaleziono APK do podpisania."
+            exit 1
+          fi
+
+          echo "Znaleziono APK: $APK"
+
+          ZIPALIGN="$ANDROID_HOME/build-tools/36.0.0/zipalign"
+          APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+
+          "$ZIPALIGN" -f 4 "$APK" /tmp/blisko-aligned.apk
+
+          "$APKSIGNER" sign \
+            --ks blisko-release.jks \
+            --ks-key-alias blisko \
+            --ks-pass "pass:$BLISKO_CLEAN_PASSWORD" \
+            --key-pass "pass:$BLISKO_CLEAN_PASSWORD" \
+            --out android/app/build/outputs/apk/release/app-release.apk \
+            /tmp/blisko-aligned.apk
+
+          "$APKSIGNER" verify --verbose --print-certs \
+            android/app/build/outputs/apk/release/app-release.apk
+
+          echo "APK podpisane i zweryfikowane."
 
       - name: Udostępnij APK
         uses: actions/upload-artifact@v4
