@@ -506,13 +506,21 @@ export default function App() {
     );
   }
 
-  const screens = {
-    today: <TodayScreen />,
-    intentions: <IntentionsScreen />,
-    journal: <JournalScreen />,
-    silence: <SilenceScreen />,
-    questions: <QuestionsScreen />,
-  };
+  function renderScreen() {
+    switch (tab) {
+      case 'intentions':
+        return IntentionsScreen();
+      case 'journal':
+        return JournalScreen();
+      case 'silence':
+        return SilenceScreen();
+      case 'questions':
+        return QuestionsScreen();
+      case 'today':
+      default:
+        return TodayScreen();
+    }
+  }
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -525,7 +533,7 @@ export default function App() {
           </View>
         </View>
 
-        <View style={styles.flex}>{screens[tab]}</View>
+        <View style={styles.flex}>{renderScreen()}</View>
 
         <View style={styles.nav}>
           {[
